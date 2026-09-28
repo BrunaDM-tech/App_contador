@@ -1,11 +1,16 @@
 import os
 import sys
+import threading
 import tkinter as tk
 from tkinter import messagebox
 from datetime import datetime
 
-from countdown_logic import CountdownTimer
+import pystray
+from PIL import Image
 
+import app_state
+import windows_startup
+from countdown_logic import CountdownTimer
 
 try:
     import winsound
@@ -15,7 +20,10 @@ except ImportError:
 
 
 def resource_path(*relative_path):
-   
+    """
+    Returns the correct file path when running with
+    'python countdown_gui.py' or inside a PyInstaller executable.
+    """
     base_path = getattr(
         sys,
         "_MEIPASS",
@@ -33,13 +41,13 @@ class CountdownGUI:
         self.root.geometry("530x320")
         self.root.resizable(False, False)
 
+        # Window icon (relogio.png must be in the same folder as the script/.exe)
         try:
             self.icon_image = tk.PhotoImage(file=resource_path("relogio.png"))
             self.root.iconphoto(False, self.icon_image)
         except tk.TclError:
-            # Se o ícone não for encontrado, o app continua funcionando normalmente
             pass
-    
+
         self.countdown = CountdownTimer()
         self.running = False
         self.alarm_triggered = False
@@ -48,10 +56,19 @@ class CountdownGUI:
         self._build_countdown_screen()
         self._build_current_clock()
 
-        self.config_screen.pack(
-            expand=True,
-            fill="both"
-        )
+        # Fechar a janela (botão X) esconde o app em vez de encerrar o processo
+        self.root.protocol("WM_DELETE_WINDOW", self.minimize_to_tray)
+
+        self.tray_icon = None
+        self._setup_tray_icon()
+
+        # Se havia uma contagem salva de uma execução anterior, retoma ela.
+        # Só mostra a tela de configuração do zero se não houver nada salvo.
+        if not self._resume_saved_countdown():
+            self.config_screen.pack(
+                expand=True,
+                fill="both"
+            )
 
     # Configure date/time
     def _build_config_screen(self):
@@ -182,6 +199,15 @@ class CountdownGUI:
             pady=25
         )
 
+        tk.Label(
+            self.countdown_screen,
+            text="Fechar a janela mantém a contagem rodando em segundo plano.",
+            font=("Segoe UI", 9),
+            fg="gray"
+        ).pack(
+            pady=(10, 0)
+        )
+
     # Live clock displayed on both screens
     def _build_current_clock(self):
         self.current_clock_label = tk.Label(
@@ -210,21 +236,54 @@ class CountdownGUI:
             self._update_current_clock
         )
 
-    # Screen events
-    def start(self):
+    # Bandeja do sistema (system tray)
+    def _setup_tray_icon(self):
         try:
-            self.countdown.set_target(
-                self.date_entry.get(),
-                self.time_entry.get()
-            )
+            tray_image = Image.open(resource_path("relogio.png"))
+        except FileNotFoundError:
+            tray_image = None
 
-        except ValueError as error:
-            messagebox.showerror(
-                "Data inválida",
-                str(error)
-            )
-            return
+        menu = pystray.Menu(
+            pystray.MenuItem("Abrir", self._restore_window, default=True),
+            pystray.MenuItem("Sair", self._exit_app),
+        )
 
+        self.tray_icon = pystray.Icon(
+            "ContadorRegressivo",
+            tray_image,
+            "Contador Regressivo",
+            menu,
+        )
+
+        threading.Thread(
+            target=self.tray_icon.run,
+            daemon=True,
+        ).start()
+
+    def minimize_to_tray(self):
+        self.root.withdraw()
+
+    # Chamado pela thread do pystray -> repassa para a thread principal do Tkinter
+    def _restore_window(self, icon=None, item=None):
+        self.root.after(0, self.root.deiconify)
+
+    def _exit_app(self, icon=None, item=None):
+        if self.tray_icon is not None:
+            self.tray_icon.stop()
+        self.root.after(0, self.root.destroy)
+
+    # Persistência: retomar contagem salva de uma execução anterior
+    def _resume_saved_countdown(self) -> bool:
+        saved_target = app_state.load_state()
+
+        if saved_target is None:
+            return False
+
+        self.countdown.restore_target(saved_target)
+        self._go_to_countdown_screen()
+        return True
+
+    def _go_to_countdown_screen(self):
         self.alarm_triggered = False
 
         self.target_label.config(
@@ -242,8 +301,59 @@ class CountdownGUI:
 
         self._update_countdown()
 
+    # Screen events
+    def start(self):
+        # Reseta o fundo de ambos os campos para branco antes de validar
+        self.date_entry.config(bg="white")
+        self.time_entry.config(bg="white")
+
+        date_str = self.date_entry.get().strip()
+        time_str = self.time_entry.get().strip()
+
+        # Validação individual da data
+        try:
+            datetime.strptime(date_str, "%d/%m/%Y")
+        except ValueError:
+            self.date_entry.config(bg="#ffcccc")
+            messagebox.showerror(
+                "Data inválida",
+                "A data deve estar no formato dd/mm/aaaa e ser válida."
+            )
+            return
+
+        # Validação individual da hora
+        try:
+            datetime.strptime(time_str, "%H:%M")
+        except ValueError:
+            self.time_entry.config(bg="#ffcccc")
+            messagebox.showerror(
+                "Hora inválida",
+                "A hora deve estar no formato hh:mm (de 00:00 a 23:59)."
+            )
+            return
+
+        # Validação lógica geral (ex: data no passado)
+        try:
+            self.countdown.set_target(date_str, time_str)
+        except ValueError as error:
+            self.date_entry.config(bg="#ffcccc")
+            self.time_entry.config(bg="#ffcccc")
+            messagebox.showerror(
+                "Erro na contagem",
+                str(error)
+            )
+            return
+
+        app_state.save_state(self.countdown.target)
+        windows_startup.register_startup()
+
+        self._go_to_countdown_screen()
+
     def go_back(self):
         self.running = False
+
+        app_state.clear_state()
+        windows_startup.unregister_startup()
 
         self.countdown_screen.pack_forget()
 
@@ -276,6 +386,23 @@ class CountdownGUI:
         )
 
     def _trigger_alarm(self):
+        # A contagem terminou: não faz sentido continuar salva nem
+        # reabrir o app sozinho da próxima vez que o Windows ligar.
+        app_state.clear_state()
+        windows_startup.unregister_startup()
+
+        self.root.deiconify()
+        self.root.lift()
+
+        if self.tray_icon is not None:
+            try:
+                self.tray_icon.notify(
+                    "O tempo que você definiu chegou a zero.",
+                    "Contador Regressivo",
+                )
+            except NotImplementedError:
+                pass
+
         if HAS_SOUND:
             for _ in range(3):
                 winsound.MessageBeep(
@@ -284,7 +411,7 @@ class CountdownGUI:
 
         messagebox.showinfo(
             "Tempo esgotado!",
-            "O tempo que você definiu chegou ao fim."
+            "O tempo que você definiu chegou a zero."
         )
 
 

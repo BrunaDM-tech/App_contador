@@ -55,6 +55,17 @@ class CountdownTimer:
 
         self.target = target
 
+    def restore_target(self, target: datetime) -> None:
+        """
+        Define o alvo diretamente, sem validação, usado ao retomar uma
+        contagem salva anteriormente (o valor já foi validado quando o
+        usuário definiu originalmente). Aceita datas no passado de propósito:
+        é o caso de o PC ter ficado desligado além do horário previsto —
+        nesse caso, queremos detectar 'já passou' e disparar o alarme,
+        não rejeitar o valor.
+        """
+        self.target = target
+
     def formatted_target(self) -> str:
 
         if self.target is None:
